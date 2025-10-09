@@ -28,6 +28,9 @@ class BluetoothManager: NSObject, ObservableObject {
     private var reconnectTimer: Timer?
     private let reconnectInterval: TimeInterval = 5.0
     private var shouldReconnect = false
+    private var lastKnownPeripheral: CBPeripheral?
+    private var reconnectAttempts = 0
+    private let maxReconnectAttempts = 100  // Keep trying for a long time
     
     private override init() {
         super.init()
@@ -88,9 +91,11 @@ class BluetoothManager: NSObject, ObservableObject {
     
     private func connectToPeripheral(_ peripheral: CBPeripheral) {
         connectedPeripheral = peripheral
+        lastKnownPeripheral = peripheral  // Remember this peripheral for reconnection
         peripheral.delegate = self
         centralManager.connect(peripheral, options: nil)
         connectionStatus = "Connecting to ESP32..."
+        reconnectAttempts = 0  // Reset attempts on new connection
     }
     
     private func startReconnectionTimer() {
@@ -98,7 +103,27 @@ class BluetoothManager: NSObject, ObservableObject {
         
         reconnectTimer?.invalidate()
         reconnectTimer = Timer.scheduledTimer(withTimeInterval: reconnectInterval, repeats: true) { [weak self] _ in
-            self?.startScanning()
+            guard let self = self else { return }
+            
+            self.reconnectAttempts += 1
+            
+            if self.reconnectAttempts <= self.maxReconnectAttempts {
+                print("Reconnection attempt \(self.reconnectAttempts)/\(self.maxReconnectAttempts)")
+                self.connectionStatus = "Reconnecting... (attempt \(self.reconnectAttempts))"
+                
+                // Try to reconnect to last known peripheral first
+                if let lastPeripheral = self.lastKnownPeripheral {
+                    print("Attempting to reconnect to last known peripheral")
+                    self.centralManager.connect(lastPeripheral, options: nil)
+                }
+                
+                // Also start scanning for new devices
+                self.startScanning()
+            } else {
+                print("Max reconnection attempts reached")
+                self.connectionStatus = "Unable to reconnect. Please restart app."
+                self.stopReconnectionTimer()
+            }
         }
     }
     
@@ -184,6 +209,10 @@ extension BluetoothManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         print("Connected to Kelvyn Temperature Monitor")
         
+        // Stop reconnection timer on successful connection
+        stopReconnectionTimer()
+        reconnectAttempts = 0
+        
         DispatchQueue.main.async {
             self.isConnected = true
             self.connectionStatus = "Connected to Temperature Monitor"
@@ -197,16 +226,28 @@ extension BluetoothManager: CBCentralManagerDelegate {
         
         DispatchQueue.main.async {
             self.isConnected = false
-            self.connectionStatus = "Disconnected from ESP32"
+            self.connectionStatus = "Disconnected - Reconnecting..."
             self.heartRateCharacteristic = nil
         }
         
-        connectedPeripheral = nil
+        // Don't clear connectedPeripheral, we might need it for reconnection
+        // connectedPeripheral = nil
         
-        // ESP32 goes to sleep after disconnection, so start reconnection process
+        // ESP32 goes to sleep after disconnection, so start reconnection process immediately
         if shouldReconnect {
+            print("Starting automatic reconnection...")
+            
+            // Try immediate reconnection first
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                if let lastPeripheral = self.lastKnownPeripheral {
+                    print("Attempting immediate reconnection to last peripheral")
+                    self.centralManager.connect(lastPeripheral, options: nil)
+                }
+            }
+            
+            // Start scanning and timer-based reconnection
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                self.connectionStatus = "ESP32 sleeping... Will reconnect when awake"
+                self.connectionStatus = "ESP32 may be sleeping... Reconnecting..."
                 self.startReconnectionTimer()
             }
         }
@@ -219,8 +260,11 @@ extension BluetoothManager: CBCentralManagerDelegate {
             self.connectionStatus = "Connection failed. Retrying..."
         }
         
+        // Don't give up, keep trying
         if shouldReconnect {
-            startReconnectionTimer()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                self.startReconnectionTimer()
+            }
         }
     }
 }
